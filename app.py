@@ -56,6 +56,7 @@ OVERPASS_URLS = (
     "https://overpass-api.de/api/interpreter",
 )
 WIKIDATA_URL = "https://www.wikidata.org/w/api.php"
+WIKIPEDIA_URL = "https://en.wikipedia.org/w/api.php"
 
 #: Greater London, as Nominatim's viewbox: west, north, east, south.
 LONDON_VIEWBOX = "-0.5103,51.6919,0.3340,51.2868"
@@ -75,7 +76,6 @@ WALK_M_PER_MIN = 80
 DETOUR_FACTOR = 1.3
 
 MAX_ROWS = 8
-NO_HOURS = "hours not listed"
 
 #: Memorial types that are too small or too many to be worth walking to.
 SKIP_MEMORIALS = {"plaque", "blue_plaque", "bench", "stolperstein", "stone"}
@@ -260,23 +260,22 @@ class App:
         lat, lon, place_name = self._geocode(location, deadline)
         places = self._find_places(interest, lat, lon, radius, deadline)
         rows = choose_rows(places)
-        descriptions = self._wikidata_descriptions(rows, deadline)
-
-        lines = []
+        intros = self._wikipedia_intros(rows, deadline)
+        missing = [r for r in rows if r["wikidata"] and r["wikipedia"] not in intros]
+        descriptions = self._wikidata_descriptions(missing, deadline)
         for place in rows:
-            description = (descriptions.get(place["wikidata"])
-                           or place["description"] or place["kind"])
-            lines.append((place["name"], description,
-                          format_distance(place["distance"]), place["hours"]))
+            place["intro"] = (intros.get(place["wikipedia"])
+                              or tag_intro(place, rows, descriptions.get(place["wikidata"])))
+        make_intros_unique(rows)
 
-        if lines:
-            table = make_table(lines)
+        if rows:
+            table = make_list(rows)
             narrative = (
-                f"{interest.title} within "
-                f"{format_metres(radius)} of {place_name}: the {len(lines)} "
-                f"best matches from OpenStreetMap, closest first. Distances "
-                f"are straight-line, with a rough walking time."
-            )
+                f"{interest.title} within {format_metres(radius)} of "
+                f"{place_name}, from OpenStreetMap, closest first (distances "
+                f"are straight-line, with a rough walking time). "
+                + contrast(rows)
+            ).strip()
         else:
             table = ""
             narrative = (
@@ -289,7 +288,7 @@ class App:
                 "location_found": place_name,
                 "interest": interest.label,
                 "radius_m": radius,
-                "count": len(lines),
+                "count": len(rows),
                 "table": table,
             },
             narrative=narrative,
@@ -426,6 +425,43 @@ class App:
                     places.append(place)
         return places if answered else None
 
+    def _wikipedia_intros(self, rows: list[dict], deadline: float) -> dict[str, str]:
+        """The first sentence or two of each English Wikipedia article, in
+        one batched request, keyed by the title in the OSM tag. Nothing if
+        Wikipedia is slow or down: Wikidata and the tags take over."""
+        titles = sorted({row["wikipedia"] for row in rows if row["wikipedia"]})
+        timeout = min(3.0, self._remaining(deadline) - 2.0)
+        if not titles or timeout < 1.0:
+            return {}
+        query = urlencode({
+            "action": "query", "prop": "extracts", "exintro": 1, "explaintext": 1,
+            "exsentences": 2, "redirects": 1, "format": "json",
+            "titles": "|".join(titles),
+        })
+        try:
+            payload = json.loads(self._fetch(f"{WIKIPEDIA_URL}?{query}", timeout=timeout))
+            result = payload["query"]
+        except (urllib.error.URLError, TimeoutError, OSError, ValueError,
+                KeyError, TypeError):
+            return {}
+        # Follow the title back through Wikipedia's normalising and redirects.
+        renamed = {}
+        for step in (result.get("normalized") or []) + (result.get("redirects") or []):
+            renamed[step.get("from")] = step.get("to")
+        extracts = {}
+        for page in (result.get("pages") or {}).values():
+            text = tidy_extract(page.get("extract") or "")
+            if text:
+                extracts[page.get("title")] = text
+        out = {}
+        for title in titles:
+            final = title
+            for _ in range(3):
+                final = renamed.get(final, final)
+            if final in extracts:
+                out[title] = extracts[final]
+        return out
+
     def _wikidata_descriptions(self, rows: list[dict], deadline: float) -> dict[str, str]:
         """Wikidata's one-line descriptions, or nothing if it is slow or down."""
         ids = sorted({row["wikidata"] for row in rows if row["wikidata"]})
@@ -498,11 +534,20 @@ def make_place(interest: Interest, tags: dict, lat: float, lon: float,
     if tags.get("memorial") in SKIP_MEMORIALS or tags.get("access") in ("private", "no"):
         return None
     wikidata = tags.get("wikidata", "")
+    wikipedia = tags.get("wikipedia", "")
+    wikipedia = wikipedia[3:].strip() if wikipedia.startswith("en:") else ""
+    year = re.match(r"\d{4}", tags.get("start_date", ""))
     return {
+        "tags": tags,
+        "wikipedia": wikipedia,
+        "year": int(year.group()) if year else None,
+        "fee": {"yes": "Paid", "no": "Free"}.get(tags.get("fee", "")),
+        "step_free": {"yes": "Step-free", "limited": "Partly step-free"}.get(
+            tags.get("wheelchair", "")),
         "name": name,
         "kind": describe_kind(tags),
         "description": osm_description(tags),
-        "hours": (tags.get("opening_hours") or "").strip() or NO_HOURS,
+        "hours": " ".join((tags.get("opening_hours") or "").split()),
         "distance": haversine_m(from_lat, from_lon, lat, lon),
         "wikidata": wikidata if re.fullmatch(r"Q\d+", wikidata) else "",
         "notable": bool(wikidata or tags.get("wikipedia")),
@@ -543,11 +588,6 @@ def describe_kind(tags: dict) -> str:
             text = tags["historic"].capitalize()
     else:
         text = "Place of interest"
-    year = re.match(r"\d{4}", tags.get("start_date", ""))
-    if year and tourism != "artwork":
-        text += f", from {year.group()}"
-    elif year:
-        text += f" ({year.group()})"
     return text
 
 
@@ -596,11 +636,104 @@ def format_distance(metres: float) -> str:
     return f"{format_metres(metres)} (~{minutes} min walk)"
 
 
-def make_table(rows: list[tuple[str, str, str, str]]) -> str:
-    def cell(text: str) -> str:
-        return " ".join(text.split()).replace("|", "\\|")
+def tidy_extract(text: str) -> str:
+    """A Wikipedia intro, trimmed to one or two clean sentences."""
+    text = re.sub(r"\s*\([^()]*\)", "", " ".join(text.split()))   # (pronunciation)
+    text = re.sub(r"\s+([,.;])", r"\1", text)
+    return shorten(text, 240)
 
-    lines = ["| Name | What it is | Distance | Opening hours |",
-             "|---|---|---|---|"]
-    lines += ["| " + " | ".join(cell(c) for c in row) + " |" for row in rows]
-    return "\n".join(lines)
+
+def tag_facts(place: dict) -> list[str]:
+    """Distinguishing facts from the OSM tags, as short phrases."""
+    tags = place["tags"]
+    facts = []
+    if place["year"]:
+        facts.append(f"dating from {place['year']}")
+    if tags.get("architect"):
+        facts.append(f"designed by {tags['architect']}")
+    listed = tags.get("listed_status") or tags.get("heritage:grade")
+    if listed:
+        facts.append(listed if "listed" in listed.lower() else f"{listed} listed")
+    denomination = tags.get("denomination")
+    if denomination:
+        facts.append(f"{denomination.replace('_', ' ').capitalize()} congregation")
+    if tags.get("cuisine"):
+        facts.append(f"serving {tags['cuisine'].replace(';', ', ').replace('_', ' ')} food")
+    if tags.get("operator"):
+        facts.append(f"run by {tags['operator']}")
+    if tags.get("inscription") and len(tags["inscription"]) <= 80:
+        facts.append(f"inscribed \u201c{tags['inscription']}\u201d")
+    return facts
+
+
+def tag_intro(place: dict, rows: list[dict], wikidata_text: str | None) -> str:
+    """One sentence for a place with no Wikipedia intro. Facts every row
+    shares (all run by the same council, say) tell nobody anything, so
+    they are dropped."""
+    base = wikidata_text or place["description"] or place["kind"]
+    facts = tag_facts(place)
+    if len(rows) > 1:
+        shared = set.intersection(*(set(tag_facts(r)) for r in rows))
+        facts = [f for f in facts if f not in shared]
+    sentence = base.rstrip(".")
+    if facts:
+        sentence += ", " + ", ".join(facts[:2])
+    return sentence[:1].upper() + sentence[1:] + "."
+
+
+ORDINALS = ("second", "third", "fourth", "fifth", "sixth", "seventh", "eighth")
+
+
+def make_intros_unique(rows: list[dict]) -> None:
+    """Never the same sentence twice: add the street, then an ordinal."""
+    seen: dict[str, int] = {}
+    for place in rows:
+        intro = place["intro"]
+        if intro in seen:
+            street = place["tags"].get("addr:street")
+            if street:
+                intro = intro.rstrip(".") + f", on {street}."
+            if intro in seen:
+                n = seen[place["intro"]]
+                intro = place["intro"].rstrip(".") + f" (the {ORDINALS[min(n - 1, 6)]} of its kind here)."
+        seen[place["intro"]] = seen.get(place["intro"], 0) + 1
+        seen.setdefault(intro, 1)
+        place["intro"] = intro
+
+
+def contrast(rows: list[dict]) -> str:
+    """One sentence telling the picks apart, built only from the data."""
+    if len(rows) < 2:
+        return ""
+    parts = [f"the closest is {rows[0]['name']}"]
+    free = [r for r in rows if r["fee"] == "Free"]
+    if len(free) == 1:
+        parts.append(f"{free[0]['name']} is the only one listed as free")
+    dated = [r for r in rows if r["year"]]
+    if len(dated) >= 2:
+        oldest = min(dated, key=lambda r: r["year"])
+        parts.append(f"{oldest['name']} is the oldest, from {oldest['year']}")
+    hours = [r for r in rows if r["hours"]]
+    if len(hours) == 1:
+        parts.append(f"only {hours[0]['name']} lists opening hours")
+    step = [r for r in rows if r["step_free"] == "Step-free"]
+    if len(step) == 1:
+        parts.append(f"{step[0]['name']} is the only one tagged step-free")
+    sentence = "; ".join(parts[:4])
+    return sentence[:1].upper() + sentence[1:] + "."
+
+
+def make_list(rows: list[dict]) -> str:
+    """One block per place, which renders cleanly in chat. A line with no
+    data is left out rather than filled with "unavailable"."""
+    blocks = []
+    for number, place in enumerate(rows, 1):
+        lines = [f"**{number}. {place['name']}**: {format_distance(place['distance'])}",
+                 place["intro"]]
+        details = [d for d in (f"Hours: {place['hours']}" if place["hours"] else "",
+                               place["fee"] or "", place["step_free"] or "") if d]
+        if details:
+            lines.append(" · ".join(details))
+        # Two trailing spaces: a hard line break in markdown.
+        blocks.append("  \n".join(lines))
+    return "\n\n".join(blocks)

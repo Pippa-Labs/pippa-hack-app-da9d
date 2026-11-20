@@ -59,7 +59,7 @@ app:
   # Three numbers. A draft can be pushed again under the same number; once a
   # version is submitted for review it is frozen, so bump this before the
   # next push (0.2.0 -> 0.2.1).
-  version: 0.2.0
+  version: 0.2.1
   # Never use the word "by" here: the badge is parsed from
   # "[via <name> <version> by <author name>]" and splits on the first "by".
   summary: >-
@@ -135,10 +135,14 @@ outcomes:
       - name: table
         type: string
         description: >-
-          A markdown table with columns Name, What it is, Distance (straight
-          line, with a rough walking time) and Opening hours. Opening hours are
-          exactly as OpenStreetMap writes them, or "hours not listed". Show it
-          to the user as it is. Empty when count is 0.
+          The places as a numbered markdown list, closest first. Each place
+          has a bold name with its straight-line distance and rough walking
+          time, a one- or two-sentence introduction saying what makes it
+          distinctive, and, only where OpenStreetMap records them, its
+          opening hours exactly as written, whether it is free or paid, and
+          step-free access. Show this list to the user exactly as given, in
+          full: do not summarise it, shorten it or turn it into a table.
+          Empty when count is 0.
 
 # This app needs no API keys: OpenStreetMap (Nominatim, Overpass) and
 # Wikidata are free and open. Never add `connectors:` or `secrets:` blocks.
